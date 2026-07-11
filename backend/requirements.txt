@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy>=2.0
+PyJWT
+pytest
+httpx
+# Postgres로 전환할 때만 필요 (기본은 SQLite)
+# psycopg2-binary
