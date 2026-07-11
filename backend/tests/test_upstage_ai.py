@@ -1,4 +1,4 @@
-"""Upstage 어댑터 테스트 — MockTransport로 요청 형태·게이트·폴백 검증 (실 API 호출 없음)."""
+"""Upstage 어댑터 테스트 — MockTransport (실 API 호출 없음). 설계: docs/LLM_PROMPTS.md"""
 import json
 import sys
 from pathlib import Path
@@ -8,7 +8,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.ai import upstage_ai
-from app.ai.upstage_ai import UpstageClassifier, UpstageSynthesizer
+from app.ai.upstage_ai import UpstageClassifier, UpstageSynthesizer, UpstageTagger
 
 
 def _mock(handler):
@@ -16,82 +16,147 @@ def _mock(handler):
                         base_url="https://api.upstage.ai/v1")
 
 
-def _ok(content: str) -> httpx.Response:
+def _ok(content) -> httpx.Response:
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
     return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
 
-def _chat_ctx(n=15, **kw):
-    ctx = {"topic": "느끼함", "n": n, "m": 9, "months": 6, "source": "all",
-           "m_desc": "만족했어요", "personal_line": "기요님 주문 전에 참고해보세요!",
-           "question": "버터갈릭 쉬림프 피자가 너무 느끼하진 않을까?",
-           "store_name": "레파레피자-망포역점", "nickname": "기요",
-           "profile_axis": {"label": "느끼함", "score": 62, "tier_name": "느끼 즐김"}}
-    ctx.update(kw)
-    return ctx
+# ── P2 분류 ──────────────────────────────────────────────────────────────────
+def test_classifier_fast_path_skips_llm(monkeypatch):
+    def handler(request):
+        raise AssertionError("키워드 단일 히트는 LLM을 호출하면 안 됨")
+
+    monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
+    assert UpstageClassifier().classify("여기 많이 매워?") == "매운맛"
 
 
-def test_classifier_parses_structured_output(monkeypatch):
+def test_classifier_ambiguous_goes_to_llm(monkeypatch):
     captured = {}
 
     def handler(request):
         captured["body"] = json.loads(request.content)
-        return _ok(json.dumps({"topic": "느끼함"}))
+        return _ok({"topic": "맛_일반"})
 
     monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
-    assert UpstageClassifier().classify("느끼하진 않을까?") == "느끼함"
-    body = captured["body"]
-    assert body["response_format"]["json_schema"]["strict"] is True
-    assert "느끼함" in body["response_format"]["json_schema"]["schema"]["properties"]["topic"]["enum"]
+    # 규칙 무매치 질문 → LLM 경로
+    assert UpstageClassifier().classify("혼밥하기 괜찮아?") == "맛_일반"
+    assert captured["body"]["response_format"]["json_schema"]["strict"] is True
+    assert captured["body"]["max_tokens"] == 30
 
 
-def test_classifier_falls_back_to_static_on_error(monkeypatch):
+def test_classifier_error_falls_back_to_static(monkeypatch):
     monkeypatch.setattr(upstage_ai, "_client",
                         _mock(lambda req: httpx.Response(500, json={"error": "boom"})))
-    assert UpstageClassifier().classify("너무 맵지 않아?") == "매운맛"  # static 규칙 결과
+    assert UpstageClassifier().classify("혼밥하기 괜찮아?") == "맛_일반"  # static fallthrough
 
 
-def test_chat_answer_injects_server_numbers(monkeypatch):
+# ── P3~P5 합성 ───────────────────────────────────────────────────────────────
+def test_synthesizer_returns_body_and_none_on_error(monkeypatch):
+    monkeypatch.setattr(upstage_ai, "_client", _mock(lambda req: _ok("본문입니다.")))
+    assert UpstageSynthesizer().chat_answer({"stat_clause": "x"}) == "본문입니다."
+
+    def boom(request):
+        raise httpx.ConnectTimeout("timeout")
+
+    monkeypatch.setattr(upstage_ai, "_client", _mock(boom))
+    assert UpstageSynthesizer().chat_answer({"stat_clause": "x"}) is None  # services가 static 폴백
+
+
+def test_synthesizer_sends_payload_as_user_json(monkeypatch):
     captured = {}
 
     def handler(request):
         captured["body"] = json.loads(request.content)
-        return _ok("느끼함 관련 메모 15건 중 9건이 만족했어요. 기요님께 잘 맞을 것 같아요! "
-                   "(최근 6개월 · 전체 이용자 기록 15건 기준)")
+        return _ok("ok")
 
     monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
-    out = UpstageSynthesizer().chat_answer(_chat_ctx())
-    assert "15건 중 9건" in out
-    user_msg = json.loads(captured["body"]["messages"][1]["content"])
-    assert user_msg["통계"]["관련 메모 수 N"] == 15  # 숫자는 서버가 주입
-    assert user_msg["profile_axis"]["score"] == 62
+    UpstageSynthesizer().nudge({"nickname_call": "기요님", "action_slot": "A!"})
+    msgs = captured["body"]["messages"]
+    assert msgs[0]["role"] == "system" and "재주문 넛지" in msgs[0]["content"]
+    assert json.loads(msgs[1]["content"])["nickname_call"] == "기요님"
+    assert captured["body"]["temperature"] == 0.3 and captured["body"]["max_tokens"] == 200
 
 
-def test_chat_answer_gate_n0_skips_llm(monkeypatch):
+# ── P1 태깅 ──────────────────────────────────────────────────────────────────
+_MEMO = "하나도 안 매움 ㅋㅋ 개실망. 담에는 순한맛 말고 시켜야지"
+
+
+def _tag_response(evidence="하나도 안 매움 ㅋㅋ 개실망"):
+    return {"analysis": "반어 — 순함인데 부정.",
+            "aspects": [{"scope": "menu", "topic": "매운맛", "value": "순함",
+                         "polarity": "negative", "intensity": 3,
+                         "evidence": evidence, "normalized": "생각보다 안 매워요"}],
+            "self_note": "담에는 순한맛 말고 시켜야지", "reorder_intent": "conditional"}
+
+
+def test_tagger_merges_chips_and_llm_with_fewshots(monkeypatch):
+    captured = {}
+
     def handler(request):
-        raise AssertionError("n=0이면 LLM을 호출하면 안 됨")
+        captured["body"] = json.loads(request.content)
+        return _ok(_tag_response())
 
     monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
-    out = UpstageSynthesizer().chat_answer(_chat_ctx(n=0, m=0))
-    assert "아직" in out  # static 고정 응답
+    out = UpstageTagger().tag(_MEMO, "dislike", ["비싼 것 같아요"], menus=["매운찜닭"], store="찜닭명가")
+
+    msgs = captured["body"]["messages"]
+    assert len(msgs) == 1 + 4 * 2 + 1  # system + few-shot 4쌍 + 가변 user
+    user_msg = json.loads(msgs[-1]["content"])
+    assert user_msg["excluded_topics"] == ["가격"]  # 칩이 처리한 토픽은 제외 지시
+    schema = captured["body"]["response_format"]["json_schema"]["schema"]
+    assert schema["required"][0] == "analysis"  # 프로퍼티 순서 = 생성 순서 (미니 CoT)
+
+    topics = [a["topic"] for a in out["aspects"]]
+    assert topics == ["가격", "매운맛"]  # 칩 + LLM 병합
+    assert out["aspects"][0]["source"] == "chip"
+    assert out["self_note"] == "담에는 순한맛 말고 시켜야지"
+    assert out["reorder_intent"] == "conditional"
 
 
-def test_chat_answer_falls_back_on_timeout(monkeypatch):
+def test_tagger_targeted_retry_then_partial_acceptance(monkeypatch):
+    calls = []
+
     def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) == 1:
+            return _ok(_tag_response(evidence="원문에 없는 문장"))  # 검증 실패 유도
+        return _ok(_tag_response())  # 수정본
+
+    monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
+    out = UpstageTagger().tag(_MEMO, "dislike", [])
+    assert len(calls) == 2
+    feedback = calls[1]["messages"][-1]["content"]
+    assert "부분문자열이 아님" in feedback and "실패 항목만 수정" in feedback
+    assert out["aspects"][0]["evidence"] == "하나도 안 매움 ㅋㅋ 개실망"
+
+
+def test_tagger_drops_still_bad_aspect_keeps_valid(monkeypatch):
+    bad = _tag_response()
+    bad["aspects"].append({"scope": "delivery", "topic": "매운맛", "value": "순함",
+                           "polarity": "negative", "intensity": 1,
+                           "evidence": "하나도 안 매움", "normalized": "x"})  # 조합 불허
+
+    monkeypatch.setattr(upstage_ai, "_client", _mock(lambda req: _ok(bad)))
+    out = UpstageTagger().tag(_MEMO, "dislike", [])
+    assert len(out["aspects"]) == 1  # 불량 aspect만 폐기 (부분 수용)
+
+
+def test_tagger_falls_back_to_static_on_failure(monkeypatch):
+    def boom(request):
         raise httpx.ConnectTimeout("timeout")
 
-    monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
-    out = UpstageSynthesizer().chat_answer(_chat_ctx())
-    assert "15건 중 9건이 만족했어요" in out  # static 템플릿 폴백
+    monkeypatch.setattr(upstage_ai, "_client", _mock(boom))
+    out = UpstageTagger().tag(_MEMO, "dislike", [])
+    assert any(a["topic"] == "매운맛" for a in out["aspects"])  # static 규칙이 잡음
+    assert out["reorder_intent"] == "conditional"
 
 
-def test_nudge_and_guide_stay_static(monkeypatch):
+def test_tagger_skips_llm_when_text_empty(monkeypatch):
     def handler(request):
-        raise AssertionError("넛지/가이드는 LLM을 호출하면 안 됨 (static 유지)")
+        raise AssertionError("텍스트 없으면 LLM 호출 금지")
 
     monkeypatch.setattr(upstage_ai, "_client", _mock(handler))
-    syn = UpstageSynthesizer()
-    assert syn.nudge({"nickname": "기요", "latest_negative": None,
-                      "satisfied_topics": [], "conditional_note": None})
-    assert syn.first_guide({"nickname": "기요", "topic": "매운맛", "n": 0, "m": 0,
-                            "months": 6, "sample_label": None,
-                            "stat_line": "", "personal_line": ""})
+    out = UpstageTagger().tag("", "like", ["양이 넉넉해요"])
+    assert out["aspects"][0]["topic"] == "양"

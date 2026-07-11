@@ -1,15 +1,22 @@
+# 로컬에 PG가 없을 때만 사용 (이미 5433에 PG를 직접 띄웠다면 이 파일은 불필요)
 services:
   db:
     image: postgres:16
+    container_name: yogiyo-db
     environment:
-      POSTGRES_USER: sokmaeum
-      POSTGRES_PASSWORD: sokmaeum
-      POSTGRES_DB: sokmaeum
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: "0000"
+      POSTGRES_DB: yogiyo
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d yogiyo"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
 volumes:
   pgdata:
-# 사용 시: DATABASE_URL=postgresql+psycopg2://sokmaeum:sokmaeum@localhost:5432/sokmaeum
+# DATABASE_URL=postgresql+psycopg2://root:0000@localhost:5433/yogiyo

@@ -2,15 +2,18 @@
 
 비공개 속마음 메모 → 태깅(17종 닫힌 어휘) → 입맛 프로필(5축) → 개인화 가이드/챗봇.
 
-- **AI는 현재 static 모드** (`LLM_PROVIDER=static`): 태깅 = 태그 칩 결정적 매핑 + 키워드 규칙(시드 사전), 답변 = f-string 템플릿. 튜닝 후 `app/ai/upstage_ai.py`(Upstage solar-pro3 + json_schema)만 구현해 env로 전환.
+- **AI 모드 2가지** (`LLM_PROVIDER=static|upstage`, 기본 static):
+  - `static` — 태깅 = 태그 칩 매핑 + 키워드 규칙, 답변 = 템플릿 (LLM 0회)
+  - `upstage` — **챗봇 경로만 LLM** (질문분류 = solar-pro3 + json_schema enum 강제, 답변 합성 = solar-pro3). 태깅·넛지·가이드는 static 유지(튜닝 후 확장). 키 미설정·호출 실패·타임아웃 시 **자동 static 폴백** — 데모 중 네트워크가 죽어도 응답은 나온다. `/chat` 응답의 `ai_mode`로 현재 모드 확인.
 - **점수·표본 수는 전부 서버가 계산** (LLM 0회 원칙) — 프로필 엔진은 순수 함수라 단위 테스트로 검증됨 (`tests/`).
 - **이중 저장**: `personal_memos`(원문, 본인만) + `anon_aspects`(원문 없음, author_hash) — 삭제 시 프로필까지 전파 재계산.
 
-## 실행 (Python 3.10+)
+## 실행 (Python 3.10+ / Docker)
 
 ```bash
 cd backend
 python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+docker compose up -d                     # PostgreSQL 16 — 이미 5433에 PG를 띄웠다면 생략
 .venv/bin/python -m seed.run_seed        # DB 초기화 + 시연 데이터
 .venv/bin/uvicorn app.main:app --port 8010 --reload
 # Swagger: http://localhost:8010/docs
@@ -18,9 +21,18 @@ python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Swagger에서 인증: `POST /auth/login` 실행 → 응답의 `token` 복사 → 우상단 **Authorize 🔒** 버튼에 붙여넣기 (Bearer 접두어 불필요). 이후 모든 요청에 자동 첨부된다.
 
-기본 DB는 SQLite(`sokmaeum.db`). Postgres 전환: `docker compose up -d` 후
-`DATABASE_URL=postgresql+psycopg2://sokmaeum:sokmaeum@localhost:5432/sokmaeum` (+ `pip install psycopg2-binary`).
-스키마 변경 시 마이그레이션 없음 — DB 지우고 재시드.
+DB 연결은 `backend/.env`의 `DATABASE_URL`로 결정 (`.env` 없으면 SQLite `sokmaeum.db` 폴백 — Docker 없이도 부팅 가능).
+스키마 변경 시 마이그레이션 없음 — 재시드(`python -m seed.run_seed`)가 drop_all 후 다시 만든다.
+DB 완전 초기화: `docker compose down -v`.
+
+### LLM(Upstage) 연동 켜기
+
+```bash
+cp .env.example .env      # UPSTAGE_API_KEY에 콘솔(console.upstage.ai)에서 발급한 키 입력
+# 서버 재시작하면 적용 — 챗봇 답변이 solar-pro3로 합성됨 (ai_mode: "upstage")
+```
+
+`.env`는 gitignore 대상. 서버 기동 로그에 "UPSTAGE_API_KEY 미설정 — static으로 폴백" 경고가 없으면 연동 성공.
 
 ## 데모 계정 (비밀번호 전부 `demo1234`)
 

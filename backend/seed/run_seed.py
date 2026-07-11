@@ -14,7 +14,7 @@ from app.auth import hash_password
 from app.db import Base, SessionLocal, engine
 from app.models import AnonAspect, Menu, PersonalMemo, Store, TasteProfile, User
 from app.services import recompute_hash_profile, recompute_user_profile, validate_aspects
-from app.ai.static_ai import StaticTagger
+from app.ai.static_ai import StaticTagger, extract_reorder, extract_self_note
 
 tagger = StaticTagger()
 
@@ -36,12 +36,13 @@ def seed_memo(db, user, store, menus_by_store, menu_names, emotion, text, chips,
     if aspects is None:
         raw = tagger.tag(text, emotion, chips)
     else:
-        raw = {"aspects": aspects, "reorder_intent": tagger._reorder(text)}
-    valid, reorder = validate_aspects(raw, text)
+        raw = {"aspects": aspects, "reorder_intent": extract_reorder(text),
+               "self_note": extract_self_note(text)}
+    valid, reorder, self_note = validate_aspects(raw, text)
     menu_ids = [menus_by_store[store.id][n].id for n in menu_names]
     memo = PersonalMemo(user_id=user.id, store_id=store.id, menu_ids=menu_ids,
                         emotion=emotion, text=text, chips=chips,
-                        reorder_intent=reorder, created_at=created)
+                        reorder_intent=reorder, self_note=self_note, created_at=created)
     db.add(memo)
     db.flush()
     for a in valid:

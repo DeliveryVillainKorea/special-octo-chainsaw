@@ -1,14 +1,14 @@
-"""static 구현 — LLM 0회.
+"""static 구현 — LLM 0회. (프롬프트 설계 v2: docs/LLM_PROMPTS.md)
 
-- StaticTagger: 태그 칩 결정적 매핑 + 자유 텍스트 키워드 규칙(시드 사전 §8)
-- StaticClassifier: 질문 키워드 → 토픽
-- StaticSynthesizer: f-string 템플릿 (숫자는 전부 서버가 센 값만 주입 — LLM 교체 후에도 동일 원칙)
+- StaticTagger: 태그 칩 결정적 매핑 + 자유 텍스트 키워드 규칙 + self_note 추출
+- StaticClassifier: 질문 키워드 → 토픽 (upstage 모드에서도 fast-path로 재사용)
+- StaticSynthesizer: LLM 페이로드와 **같은 형태**를 소비해 본문만 렌더
+  (꼬리표는 services.render_footer가 부착 — static/LLM 폴백이 바이트 단위로 안 보이게)
 """
 import re
 
-from ..taxonomy import (ACTION_SUGGESTIONS, CHIP_MAP, DEFAULT_SUGGESTION, INTENSITY_2,
-                        INTENSITY_3, KEYWORD_RULES, REORDER_COND, REORDER_NEG, REORDER_POS,
-                        TOPICS)
+from ..taxonomy import (CHIP_MAP, INTENSITY_2, INTENSITY_3, KEYWORD_RULES, REORDER_COND,
+                        REORDER_NEG, REORDER_POS, TOPICS)
 
 
 def _clause_around(text: str, keyword: str) -> str:
@@ -35,24 +35,48 @@ def _intensity_of(text: str, base: int = 1) -> int:
     return base
 
 
+def chips_to_aspects(chips: list[str]) -> list[dict]:
+    """칩 → aspect 결정적 매핑 (서버 소유 — LLM 태거 모드에서도 이 함수가 처리)."""
+    out = []
+    for chip in chips:
+        if chip not in CHIP_MAP:
+            continue
+        topic, value, polarity, intensity, scope = CHIP_MAP[chip]
+        out.append({"scope": scope, "topic": topic, "value": value, "polarity": polarity,
+                    "intensity": intensity, "evidence": None, "normalized": chip,
+                    "source": "chip"})
+    return out
+
+
+def extract_reorder(text: str) -> str:
+    for w in REORDER_NEG:
+        if w in text:
+            return "neg"
+    for w in REORDER_POS:
+        if w in text:
+            return "pos"
+    for w in REORDER_COND:
+        if w in text:
+            return "conditional"
+    return "none"
+
+
+def extract_self_note(text: str) -> str:
+    """'다음엔 이렇게 해야지' 다짐 구절 — 원문 절 그대로 (부분문자열 보장)."""
+    for w in REORDER_COND:
+        if w in text:
+            return _clause_around(text, w)[:120]
+    return ""
+
+
 class StaticTagger:
-    def tag(self, text: str, emotion: str, chips: list[str]) -> dict:
+    def tag(self, text: str, emotion: str, chips: list[str],
+            menus: list[str] | None = None, store: str | None = None) -> dict:
         polarity_default = "positive" if emotion == "like" else "negative"
-        aspects: list[dict] = []
-        seen_topics: set[str] = set()
+        aspects = chips_to_aspects(chips)
+        seen_topics = {a["topic"] for a in aspects}
 
-        # 1) 칩 → 결정적 매핑 (우선)
-        for chip in chips:
-            if chip not in CHIP_MAP:
-                continue
-            topic, value, polarity, intensity, scope = CHIP_MAP[chip]
-            aspects.append({
-                "scope": scope, "topic": topic, "value": value, "polarity": polarity,
-                "intensity": intensity, "evidence": None, "normalized": chip, "source": "chip",
-            })
-            seen_topics.add(topic)
-
-        # 2) 자유 텍스트 키워드 규칙 (칩과 중복 토픽은 건너뜀 — 이중 집계 방지)
+        # 자유 텍스트 키워드 규칙 (칩과 중복 토픽은 건너뜀 — 이중 집계 방지)
         for pattern, topic, value, normalized in KEYWORD_RULES:
             if topic in seen_topics or pattern not in text:
                 continue
@@ -66,8 +90,7 @@ class StaticTagger:
             })
             seen_topics.add(topic)
 
-        # 3) 아무 태그도 없으면 맛_일반 극성 1건 (총평 수렴처)
-        if not aspects:
+        if not aspects:  # 아무 태그도 없으면 맛_일반 극성 1건 (총평 수렴처)
             aspects.append({
                 "scope": "menu", "topic": "맛_일반", "value": None,
                 "polarity": polarity_default, "intensity": 1,
@@ -76,24 +99,12 @@ class StaticTagger:
                 "source": "text",
             })
 
-        return {"aspects": aspects, "reorder_intent": self._reorder(text)}
-
-    @staticmethod
-    def _reorder(text: str) -> str:
-        for w in REORDER_NEG:
-            if w in text:
-                return "neg"
-        for w in REORDER_POS:
-            if w in text:
-                return "pos"
-        for w in REORDER_COND:
-            if w in text:
-                return "conditional"
-        return "none"
+        return {"aspects": aspects, "reorder_intent": extract_reorder(text),
+                "self_note": extract_self_note(text)}
 
 
 class StaticClassifier:
-    """질문 → 토픽 (닫힌 어휘라 키워드 매칭으로 충분)."""
+    """질문 → 토픽. upstage 모드에서도 단일 키워드 히트는 이 규칙이 fast-path로 처리."""
 
     RULES = [
         (["맵", "매워", "매운"], "매운맛"),
@@ -106,10 +117,13 @@ class StaticClassifier:
         (["배달", "빨리", "늦"], "배달속도"),
         (["가격", "비싸", "가성비"], "가격"),
         (["포장"], "포장"),
-        (["아이랑", "애기", "아이가"], "매운맛"),  # "아이랑 먹기 좋아?" → 맵기 관심사로 해석
+        (["아이랑", "애기", "아이가"], "매운맛"),  # "아이랑 먹기 좋아?" → 맵기 관심사
         (["서비스", "친절"], "서비스"),
         (["신선"], "신선도"),
     ]
+
+    def keyword_hits(self, question: str) -> set[str]:
+        return {t for kws, t in self.RULES if any(k in question for k in kws)}
 
     def classify(self, question: str) -> str:
         for keywords, topic in self.RULES:
@@ -118,52 +132,57 @@ class StaticClassifier:
         return "맛_일반"
 
 
+# ── 본문 렌더러 (payload 형태는 LLM과 동일 — docs/LLM_PROMPTS.md §P3~P5) ─────
+def _tier_line(p: dict) -> str:
+    ax = p.get("profile_axis")
+    nick = p.get("nickname_call", "회원님")
+    if ax and ax.get("tier_name"):
+        return f"평소 {ax['tier_name']}이신 {nick}에게 참고가 될 것 같아요."
+    return f"{nick} 주문 전에 참고해보세요!"
+
+
 class StaticSynthesizer:
-    """서버가 계산한 수치만 문장에 끼워넣는다 (표본 수·분포는 절대 생성하지 않음)."""
+    """서버가 조립한 stat_clause·action_slot을 그대로 엮는다. 꼬리표는 안 쓴다(서버 부착)."""
 
-    # ── 재주문 넛지 (STEP 3-A) ──────────────────────────────────────────
-    def nudge(self, ctx: dict) -> str:
-        nick = ctx["nickname"]
-        neg = ctx.get("latest_negative")          # {menu_name, topic, normalized, direction}
-        pos_topics = ctx.get("satisfied_topics", [])
-        if neg:
-            suggestion = ACTION_SUGGESTIONS.get((neg["topic"], neg["direction"]), DEFAULT_SUGGESTION)
+    def chat_answer(self, p: dict) -> str:
+        parts = [p["stat_clause"]]
+        own = p.get("own_memos") or []
+        if own:
+            m0 = own[0]
+            parts.append(f"{p['nickname_call']}도 {m0['when_label']} {m0['menu']}에 "
+                         f"'{m0['quote']}'라고 남기셨죠.")
+        else:
+            parts.append(_tier_line(p))
+        if p.get("action_slot"):
+            parts.append(p["action_slot"])
+        return " ".join(parts)
+
+    def nudge(self, p: dict) -> str:
+        sn = p.get("self_note")
+        if sn:
+            return (f"지난번에 '{sn['quote']}'라고 남기셨죠. {p['action_slot']}")
+        ln = p.get("latest_negative")
+        if ln:
             head = ""
-            if pos_topics:
-                head = f"{'·'.join(pos_topics[:2])}은(는) 늘 만족하셨는데, "
-            menu = f"'{neg['menu_name']}'" if neg.get("menu_name") else "지난 주문"
-            return f"{head}{menu}은(는) {neg['normalized']} 기록이 있어요. {suggestion}"
-        cond = ctx.get("conditional_note")
-        if cond:
-            return f"지난번에 \"{cond}\"라고 메모하셨죠. 이번 주문에 반영해보세요!"
-        return f"이 가게는 늘 만족하셨어요, {nick}님. 지난번과 같은 구성으로 재주문 어때요?"
+            praise = p.get("praise_topics") or []
+            if praise:
+                head = f"{'·'.join(praise[:2])}은(는) 늘 만족하셨는데, "
+            return (f"{head}{ln['when_label']} '{ln['menu']}'는 '{ln['quote']}' 기록이 있어요. "
+                    f"{p['action_slot']}")
+        return f"이 가게는 늘 만족하셨어요, {p['nickname_call']}. 같은 구성으로 재주문 어때요?"
 
-    # ── 첫 주문 가게 가이드 (STEP 3-B) ──────────────────────────────────
-    def first_guide(self, ctx: dict) -> str:
-        nick, topic = ctx["nickname"], ctx["topic"]
-        n, m = ctx["n"], ctx["m"]
-        months, label = ctx["months"], ctx.get("sample_label")
-        if n == 0:
-            return "아직 이 가게의 속마음 데이터가 부족해요. 첫 기록의 주인공이 되어주세요!"
-        if n <= 2:
-            return (f"이 가게의 속마음 데이터가 아직 {n}건뿐이라 정리해 드리기엔 일러요. "
-                    f"주문하시면 {nick}님의 기록이 큰 도움이 돼요!")
-        tail = f" (최근 {months}개월, 관련 메모 {n}건 기준{'·참고용' if label else ''})"
-        my_line = ctx.get("personal_line", "")
-        return f"{ctx['stat_line']} {my_line}{tail}"
-
-    # ── 챗봇 답변 (STEP 3-C) ────────────────────────────────────────────
-    def chat_answer(self, ctx: dict) -> str:
-        topic, n, m = ctx["topic"], ctx["n"], ctx["m"]
-        months, source = ctx["months"], ctx["source"]  # source: 이웃 | 전체
-        if n == 0:
-            return ("아직 이 주제의 속마음 데이터가 없어요. 관련 기록이 쌓이면 "
-                    "바로 알려드릴게요!")
-        label = "입맛이 비슷한 이용자" if source == "neighbor" else "전체 이용자"
-        stat = f"{topic} 관련 메모 {n}건 중 {m}건이 {ctx['m_desc']}."
-        my_line = ctx.get("personal_line", "")
-        note = "·참고용" if 3 <= n <= 4 else ""
-        return f"{stat} {my_line} (최근 {months}개월 · {label} 기록 {n}건 기준{note})"
+    def first_guide(self, p: dict) -> str:
+        parts = [p["stat_clause"]]
+        ax, nick = p.get("profile_axis"), p.get("nickname_call", "회원님")
+        if p.get("fit_hint") == "충돌" and ax:
+            parts.append(f"평소 {ax['tier_name']}이신 {nick}에게는 살짝 벅찰 수 있어요.")
+        elif p.get("fit_hint") == "잘맞음" and ax:
+            parts.append(f"{ax['tier_name']}이신 {nick} 입맛에는 오히려 반가운 소식이에요.")
+        else:
+            parts.append(_tier_line(p))
+        if p.get("action_slot"):
+            parts.append(p["action_slot"])
+        return " ".join(parts)
 
 
 tagger = StaticTagger()

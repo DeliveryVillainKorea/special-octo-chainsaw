@@ -22,6 +22,8 @@ TOKEN_TTL_HOURS = int(os.environ.get("TOKEN_TTL_HOURS", "72"))
 #   upstage — 챗봇 경로(질문분류·답변 합성)만 solar-pro3, 태깅·넛지는 static 유지.
 #             호출 실패/키 미설정 시 자동 static 폴백.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "static")
+# 태깅만 별도 스위치 (P1은 동기 호출이 메모 저장 UX를 막으므로 기본 static 유지)
+LLM_TAGGING = os.environ.get("LLM_TAGGING", "static")
 UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.upstage.ai/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "solar-pro3")

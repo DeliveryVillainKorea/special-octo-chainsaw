@@ -7,7 +7,7 @@ from .routers import auth_router, chat_router, me_router, memo_router, owner_rou
 app = FastAPI(
     title="속마음 리뷰 API (요기요 해커톤 PoC)",
     description="비공개 속마음 메모 → 입맛 프로필 → 개인화 가이드/챗봇. "
-                "현재 LLM_PROVIDER=static (규칙 태거 + 템플릿), 튜닝 후 Upstage solar-pro3로 교체 예정.",
+                "LLM_PROVIDER=static(규칙+템플릿) | upstage(챗봇만 solar-pro3, 실패 시 static 폴백).",
     version="0.1.0",
 )
 

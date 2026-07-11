@@ -46,6 +46,8 @@ class PersonalMemo(Base):
     text: Mapped[str] = mapped_column(Text, default="")
     chips: Mapped[list] = mapped_column(JSON, default=list)
     reorder_intent: Mapped[str] = mapped_column(String(15), default="none")  # pos|neg|conditional|none
+    # "다음 주문엔 이렇게 해야지" 다짐 구절 — 원문 부분문자열 검증 후 저장 (넛지 1문장 재료)
+    self_note: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     aspects: Mapped[list["MemoAspect"]] = relationship(back_populates="memo", cascade="all, delete-orphan")
 
